@@ -57,7 +57,6 @@ pub struct Connection {
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
-
 pub struct MutSlab {
     pub inner: UnsafeCell<Slab<Arc<Connection>>>
 }

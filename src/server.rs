@@ -5,24 +5,26 @@
 // distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 
-
-use std::{mem, thread};
-use std::io::{Error, ErrorKind};
-use std::time::Duration;
 use std::cell::UnsafeCell;
+use std::io::{Error, ErrorKind};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, Mutex};
-use std::net::{TcpStream, TcpListener};
-use std::os::unix::io::{RawFd, AsRawFd, IntoRawFd};
+use std::time::Duration;
+use std::{mem, thread};
 
-use libc;
 use errno::errno;
-use threadpool::ThreadPool;
+use libc;
 use simple_slab::Slab;
+use threadpool::ThreadPool;
 
-use types::*;
+use crate::types::{
+    Connection, ConnectionSlab, EventHandler, HydrogenSocket, IoEvent, IoPair, IoQueue, MutSlab,
+    NewConnectionSlab,
+};
 use config::Config;
-use super::Handler;
 
+use super::Handler;
 
 // When added to epoll, these will be the conditions of kernel notification:
 //
@@ -32,10 +34,7 @@ use super::Handler;
 // EPOLLONESHOT     - After an event is pulled out with epoll_wait(2) the associated
 //                    file descriptor is internally disabled and no other events will
 //                    be reported by the epoll interface.
-const DEFAULT_EVENTS: i32 = libc::EPOLLIN |
-                            libc::EPOLLRDHUP |
-                            libc::EPOLLET |
-                            libc::EPOLLONESHOT;
+const DEFAULT_EVENTS: i32 = libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET | libc::EPOLLONESHOT;
 
 // Maximum number of events returned from epoll_wait
 const MAX_EVENTS: i32 = 100;
@@ -55,7 +54,7 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
 
     // Create our connection slab
     let mut_slab = MutSlab {
-        inner: UnsafeCell::new(Slab::<Arc<Connection>>::with_capacity(cfg.pre_allocated))
+        inner: UnsafeCell::new(Slab::<Arc<Connection>>::with_capacity(cfg.pre_allocated)),
     };
     let connection_slab = Arc::new(mut_slab);
 
@@ -66,9 +65,7 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
     unsafe {
         thread::Builder::new()
             .name("Event Loop".to_string())
-            .spawn(move || {
-                event_loop(new_connections, connection_slab, eh_clone, threads)
-            })
+            .spawn(move || event_loop(new_connections, connection_slab, eh_clone, threads))
             .unwrap();
     }
 
@@ -77,7 +74,7 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
     let listener_thread = unsafe {
         thread::Builder::new()
             .name("TcpListener Loop".to_string())
-            .spawn(move || { listener_loop(cfg, new_connection_slab, eh_clone) })
+            .spawn(move || listener_loop(cfg, new_connection_slab, eh_clone))
             .unwrap()
     };
     let _ = listener_thread.join();
@@ -100,7 +97,7 @@ unsafe fn listener_loop(cfg: Config, new_connections: NewConnectionSlab, handler
     for accept_attempt in listener.incoming() {
         match accept_attempt {
             Ok(tcp_stream) => handle_new_connection(tcp_stream, &new_connections, handler.clone()),
-            Err(e) => error!("Accepting connection: {}", e)
+            Err(e) => error!("Accepting connection: {}", e),
         };
     }
 
@@ -117,10 +114,11 @@ unsafe fn setup_listener_options(listener: &TcpListener, handler: EventHandler) 
     (*handler_ptr).on_server_created(fd);
 }
 
-unsafe fn handle_new_connection(tcp_stream: TcpStream,
-                                new_connections: &NewConnectionSlab,
-                                handler: EventHandler)
-{
+unsafe fn handle_new_connection(
+    tcp_stream: TcpStream,
+    new_connections: &NewConnectionSlab,
+    handler: EventHandler,
+) {
     debug!("New connection received");
     // Take ownership of tcp_stream's underlying file descriptor
     let fd = tcp_stream.into_raw_fd();
@@ -134,24 +132,25 @@ unsafe fn handle_new_connection(tcp_stream: TcpStream,
         fd: fd,
         err_mutex: Mutex::new(None),
         tx_mutex: Mutex::new(()),
-        stream: arc_stream
+        stream: arc_stream,
     };
 
     // Insert it into the NewConnectionSlab
     let mut slab = match (*new_connections).lock() {
         Ok(g) => g,
-        Err(p) => p.into_inner()
+        Err(p) => p.into_inner(),
     };
 
     (&mut *slab).insert(connection);
 }
 
 /// Main event loop
-unsafe fn event_loop(new_connections: NewConnectionSlab,
-                     connection_slab: ConnectionSlab,
-                     handler: EventHandler,
-                     threads: usize)
-{
+unsafe fn event_loop(
+    new_connections: NewConnectionSlab,
+    connection_slab: ConnectionSlab,
+    handler: EventHandler,
+    threads: usize,
+) {
     info!("Event loop starting...");
     const MAX_WAIT: i32 = 1000; // Milliseconds
 
@@ -174,7 +173,9 @@ unsafe fn event_loop(new_connections: NewConnectionSlab,
     let thread_pool = ThreadPool::new(threads);
 
     // Our I/O queue for Connections needing various I/O operations.
-    let arc_io_queue = Arc::new(Mutex::new(Vec::<IoPair>::with_capacity(MAX_EVENTS as usize)));
+    let arc_io_queue = Arc::new(Mutex::new(Vec::<IoPair>::with_capacity(
+        MAX_EVENTS as usize,
+    )));
 
     // Start the I/O Sentinel
     let t_pool_clone = thread_pool.clone();
@@ -182,9 +183,7 @@ unsafe fn event_loop(new_connections: NewConnectionSlab,
     let io_queue = arc_io_queue.clone();
     thread::Builder::new()
         .name("I/O Sentinel".to_string())
-        .spawn(move || {
-            io_sentinel(io_queue, t_pool_clone, handler_clone)
-        })
+        .spawn(move || io_sentinel(io_queue, t_pool_clone, handler_clone))
         .unwrap();
 
     // Scratch space for epoll returned events
@@ -208,16 +207,21 @@ unsafe fn event_loop(new_connections: NewConnectionSlab,
         }
 
         let num_events = result as usize;
-        update_io_events(&connection_slab, &arc_io_queue, &event_buffer[0..num_events]);
+        update_io_events(
+            &connection_slab,
+            &arc_io_queue,
+            &event_buffer[0..num_events],
+        );
     }
 }
 
 /// Traverses through the connection slab and creates a list of connections that need dropped,
 /// then traverses that list, drops them, and informs the handler of client drop.
-unsafe fn remove_stale_connections(connection_slab: &ConnectionSlab,
-                                   thread_pool: &ThreadPool,
-                                   handler: &EventHandler)
-{
+unsafe fn remove_stale_connections(
+    connection_slab: &ConnectionSlab,
+    thread_pool: &ThreadPool,
+    handler: &EventHandler,
+) {
     let slab_ptr = (*connection_slab).inner.get();
 
     let mut x: isize = 0;
@@ -265,12 +269,13 @@ unsafe fn close_connection(connection: &Arc<Connection>) {
 }
 
 /// Transfers Connections from the new_connections slab to the "main" connection_slab.
-unsafe fn insert_new_connections(new_connections: &NewConnectionSlab,
-                                 connection_slab: &ConnectionSlab)
-{
+unsafe fn insert_new_connections(
+    new_connections: &NewConnectionSlab,
+    connection_slab: &ConnectionSlab,
+) {
     let mut new_slab = match new_connections.lock() {
         Ok(g) => g,
-        Err(p) => p.into_inner()
+        Err(p) => p.into_inner(),
     };
 
     let num_connections = (&mut *new_slab).len();
@@ -287,13 +292,15 @@ unsafe fn insert_new_connections(new_connections: &NewConnectionSlab,
 unsafe fn add_connection_to_epoll(arc_connection: &Arc<Connection>) {
     let fd = (*arc_connection).fd;
     debug!("Adding fd {} to epoll", fd);
-    let result = libc::epoll_ctl(epfd,
-                                 libc::EPOLL_CTL_ADD,
-                                 fd,
-                                 &mut libc::epoll_event {
-                                     events: DEFAULT_EVENTS as u32,
-                                     u64: fd as u64
-                                 });
+    let result = libc::epoll_ctl(
+        epfd,
+        libc::EPOLL_CTL_ADD,
+        fd,
+        &mut libc::epoll_event {
+            events: DEFAULT_EVENTS as u32,
+            u64: fd as u64,
+        },
+    );
 
     if result < 0 {
         let err = Error::from_raw_os_error(errno().0 as i32);
@@ -301,7 +308,7 @@ unsafe fn add_connection_to_epoll(arc_connection: &Arc<Connection>) {
 
         let mut err_state = match arc_connection.err_mutex.lock() {
             Ok(g) => g,
-            Err(p) => p.into_inner()
+            Err(p) => p.into_inner(),
         };
 
         *err_state = Some(err);
@@ -315,10 +322,15 @@ unsafe fn rearm_connection_in_epoll(arc_connection: &Arc<Connection>, flags: i32
 
     trace!("EPOLL_CTL_MOD   fd: {}    flags: {:#b}", fd, (flags as u32));
 
-    let result = libc::epoll_ctl(epfd,
-                                 libc::EPOLL_CTL_MOD,
-                                 fd,
-                                 &mut libc::epoll_event { events: events as u32, u64: fd as u64 });
+    let result = libc::epoll_ctl(
+        epfd,
+        libc::EPOLL_CTL_MOD,
+        fd,
+        &mut libc::epoll_event {
+            events: events as u32,
+            u64: fd as u64,
+        },
+    );
 
     if result < 0 {
         let err = Error::from_raw_os_error(errno().0 as i32);
@@ -326,7 +338,7 @@ unsafe fn rearm_connection_in_epoll(arc_connection: &Arc<Connection>, flags: i32
 
         let mut err_state = match arc_connection.err_mutex.lock() {
             Ok(g) => g,
-            Err(p) => p.into_inner()
+            Err(p) => p.into_inner(),
         };
 
         *err_state = Some(err);
@@ -334,10 +346,11 @@ unsafe fn rearm_connection_in_epoll(arc_connection: &Arc<Connection>, flags: i32
 }
 
 /// Traverses the ConnectionSlab and updates any connection's state reported changed by epoll.
-unsafe fn update_io_events(connection_slab: &ConnectionSlab,
-                           arc_io_queue: &IoQueue,
-                           events: &[libc::epoll_event])
-{
+unsafe fn update_io_events(
+    connection_slab: &ConnectionSlab,
+    arc_io_queue: &IoQueue,
+    events: &[libc::epoll_event],
+) {
     const READ_EVENT: u32 = libc::EPOLLIN as u32;
     const WRITE_EVENT: u32 = libc::EPOLLOUT as u32;
     const CLOSE_EVENT: u32 = (libc::EPOLLRDHUP | libc::EPOLLERR | libc::EPOLLHUP) as u32;
@@ -361,13 +374,17 @@ unsafe fn update_io_events(connection_slab: &ConnectionSlab,
         // Error/hangup occurred?
         let close_event = (event.events & CLOSE_EVENT) > 0;
         if close_event {
-            { // Mutex lock
+            {
+                // Mutex lock
                 let mut err_opt = match arc_connection.err_mutex.lock() {
                     Ok(g) => g,
-                    Err(p) => p.into_inner()
+                    Err(p) => p.into_inner(),
                 };
 
-                *err_opt = Some(Error::new(ErrorKind::ConnectionAborted, "ConnectionAborted"));
+                *err_opt = Some(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "ConnectionAborted",
+                ));
             } // Mutex unlock
             continue;
         }
@@ -377,13 +394,17 @@ unsafe fn update_io_events(connection_slab: &ConnectionSlab,
         let write_available = (event.events & WRITE_EVENT) > 0;
         if !read_available && !write_available {
             trace!("Event was neither read nor write: assuming hangup");
-            { // Mutex lock
+            {
+                // Mutex lock
                 let mut err_opt = match arc_connection.err_mutex.lock() {
                     Ok(g) => g,
-                    Err(p) => p.into_inner()
+                    Err(p) => p.into_inner(),
                 };
 
-                *err_opt = Some(Error::new(ErrorKind::ConnectionAborted, "ConnectionAborted"));
+                *err_opt = Some(Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "ConnectionAborted",
+                ));
             } // Mutex unlock
             continue;
         }
@@ -401,14 +422,15 @@ unsafe fn update_io_events(connection_slab: &ConnectionSlab,
 
         let io_pair = IoPair {
             event: io_event,
-            arc_connection: arc_connection
+            arc_connection: arc_connection,
         };
 
         trace!("Adding event to queue");
-        { // Mutex lock
+        {
+            // Mutex lock
             let mut io_queue = match arc_io_queue.lock() {
                 Ok(g) => g,
-                Err(p) => p.into_inner()
+                Err(p) => p.into_inner(),
             };
 
             (*io_queue).push(io_pair);
@@ -417,10 +439,10 @@ unsafe fn update_io_events(connection_slab: &ConnectionSlab,
 }
 
 /// Given a fd and ConnectionSlab, returns the Connection associated with fd.
-unsafe fn find_connection_from_fd(fd: RawFd,
-                                  connection_slab: &ConnectionSlab)
-                                  -> Result<Arc<Connection>, ()>
-{
+unsafe fn find_connection_from_fd(
+    fd: RawFd,
+    connection_slab: &ConnectionSlab,
+) -> Result<Arc<Connection>, ()> {
     let slab_ptr = (*connection_slab).inner.get();
     for ref arc_connection in (*slab_ptr).iter() {
         if (*arc_connection).fd == fd {
@@ -442,10 +464,11 @@ unsafe fn io_sentinel(arc_io_queue: IoQueue, thread_pool: ThreadPool, handler: E
         thread::sleep(wait_interval);
 
         let io_queue;
-        { // Mutex lock
+        {
+            // Mutex lock
             let mut queue = match arc_io_queue.lock() {
                 Ok(g) => g,
-                Err(p) => p.into_inner()
+                Err(p) => p.into_inner(),
             };
 
             let empty_queue = Vec::<IoPair>::with_capacity(MAX_EVENTS as usize);
@@ -453,38 +476,34 @@ unsafe fn io_sentinel(arc_io_queue: IoQueue, thread_pool: ThreadPool, handler: E
         } // Mutex unlock
 
         if io_queue.len() > 0 {
-        trace!("Processing {} I/O events", io_queue.len());
-    }
+            trace!("Processing {} I/O events", io_queue.len());
+        }
 
-    for ref io_pair in io_queue.iter() {
-        let io_event = io_pair.event.clone();
-        let handler_clone = handler.clone();
-        let arc_connection = io_pair.arc_connection.clone();
-        thread_pool.execute(move || {
-            let mut rearm_events = 0i32;
-            if io_event == IoEvent::WriteAvailable
-                || io_event == IoEvent::ReadWriteAvailable
-            {
-                let flags = handle_write_event(arc_connection.clone());
-                if flags == -1 {
-                    return;
+        for ref io_pair in io_queue.iter() {
+            let io_event = io_pair.event.clone();
+            let handler_clone = handler.clone();
+            let arc_connection = io_pair.arc_connection.clone();
+            thread_pool.execute(move || {
+                let mut rearm_events = 0i32;
+                if io_event == IoEvent::WriteAvailable || io_event == IoEvent::ReadWriteAvailable {
+                    let flags = handle_write_event(arc_connection.clone());
+                    if flags == -1 {
+                        return;
+                    }
+                    rearm_events |= flags;
                 }
-                rearm_events |= flags;
-            }
-            if io_event == IoEvent::ReadAvailable
-                || io_event == IoEvent::ReadWriteAvailable
-            {
-                let flags = handle_read_event(arc_connection.clone(), handler_clone);
-                if flags == -1 {
-                    return;
+                if io_event == IoEvent::ReadAvailable || io_event == IoEvent::ReadWriteAvailable {
+                    let flags = handle_read_event(arc_connection.clone(), handler_clone);
+                    if flags == -1 {
+                        return;
+                    }
+                    rearm_events |= flags;
                 }
-                rearm_events |= flags;
-            }
 
-            rearm_connection_in_epoll(&arc_connection, rearm_events);
-        });
+                rearm_connection_in_epoll(&arc_connection, rearm_events);
+            });
+        }
     }
-}
 }
 
 /// Handles an EPOLLOUT event. An empty buffer is sent down the tx line to
@@ -492,10 +511,11 @@ unsafe fn io_sentinel(arc_io_queue: IoQueue, thread_pool: ThreadPool, handler: E
 unsafe fn handle_write_event(arc_connection: Arc<Connection>) -> i32 {
     debug!("Handling a write backlog event...");
     let err;
-    { // Mutex lock
+    {
+        // Mutex lock
         drop(match arc_connection.tx_mutex.lock() {
             Ok(g) => g,
-            Err(p) => p.into_inner()
+            Err(p) => p.into_inner(),
         });
 
         // Get a pointer into UnsafeCell<Stream>
@@ -515,10 +535,11 @@ unsafe fn handle_write_event(arc_connection: Arc<Connection>) -> i32 {
         }
     } // Mutex unlock
 
-    { // Mutex lock
+    {
+        // Mutex lock
         let mut err_state = match arc_connection.err_mutex.lock() {
             Ok(g) => g,
-            Err(p) => p.into_inner()
+            Err(p) => p.into_inner(),
         };
 
         *err_state = Some(err);
@@ -537,8 +558,8 @@ unsafe fn handle_read_event(arc_connection: Arc<Connection>, handler: EventHandl
             trace!("Read {} msgs", queue.len());
             for msg in queue.drain(..) {
                 let EventHandler(ptr) = handler;
-                let hydrogen_socket = HydrogenSocket::new(arc_connection.clone(),
-                                                          rearm_connection_in_epoll);
+                let hydrogen_socket =
+                    HydrogenSocket::new(arc_connection.clone(), rearm_connection_in_epoll);
                 (*ptr).on_data_received(hydrogen_socket, msg);
             }
             return libc::EPOLLIN;
@@ -560,12 +581,13 @@ unsafe fn handle_read_event(arc_connection: Arc<Connection>, handler: EventHandl
                 debug!("Received during read:    {}", err);
             }
 
-            { // Mutex lock
+            {
+                // Mutex lock
                 // If we're in a state of ShouldClose, no need to worry
                 // about any other operations...
                 let mut err_state = match arc_connection.err_mutex.lock() {
                     Ok(g) => g,
-                    Err(p) => p.into_inner()
+                    Err(p) => p.into_inner(),
                 };
 
                 *err_state = Some(err);
