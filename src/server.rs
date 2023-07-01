@@ -7,7 +7,6 @@
 
 
 use std::{mem, thread};
-use std::error::Error as StdError;
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 use std::cell::UnsafeCell;
@@ -45,8 +44,7 @@ const MAX_EVENTS: i32 = 100;
 #[allow(non_upper_case_globals)]
 static mut epfd: RawFd = 0 as RawFd;
 
-
-pub fn begin(handler: Box<Handler>, cfg: Config) {
+pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
     info!("Starting server...");
 
     // Wrap handler in something we can share between threads
@@ -228,7 +226,7 @@ unsafe fn remove_stale_connections(connection_slab: &ConnectionSlab,
             let state = (*slab_ptr)[x as usize].err_mutex.lock().unwrap();
             if state.is_some() {
                 let err_kind = (*state).as_ref().unwrap().kind();
-                let err_desc = (*state).as_ref().unwrap().description();
+                let err_desc = (*state).as_ref().unwrap().to_string();
                 Some(Error::new(err_kind, err_desc))
             } else {
                 None
@@ -348,7 +346,9 @@ unsafe fn update_io_events(connection_slab: &ConnectionSlab,
         // Locate the connection this event is for
         let fd = event.u64 as RawFd;
 
-        trace!("Epoll event for fd: {}    flags: {:#b}", fd, event.events);
+        let flags = event.events;
+
+        trace!("Epoll event for fd: {fd}    flags: {flags:#b}");
 
         let find_result = find_connection_from_fd(fd, connection_slab);
         if find_result.is_err() {
@@ -493,10 +493,10 @@ unsafe fn handle_write_event(arc_connection: Arc<Connection>) -> i32 {
     debug!("Handling a write backlog event...");
     let err;
     { // Mutex lock
-        let _ = match arc_connection.tx_mutex.lock() {
+        drop(match arc_connection.tx_mutex.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner()
-        };
+        });
 
         // Get a pointer into UnsafeCell<Stream>
         let stream_ptr = arc_connection.stream.get();

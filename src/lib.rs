@@ -161,7 +161,7 @@ pub trait Handler {
     /// This method is called whenever `accept` returns a new TCP connection.
     ///
     /// The returned trait object is added to the connection pool and the epoll interest list.
-    fn on_new_connection(&mut self, fd: RawFd) -> Arc<UnsafeCell<Stream>>;
+    fn on_new_connection(&mut self, fd: RawFd) -> Arc<UnsafeCell<dyn Stream>>;
     /// This method is called whenever the `recv` call returns an Ok(_) result.
     fn on_data_received(&mut self, socket: HydrogenSocket, buf: Vec<u8>);
     /// This method is called after a stream has been removed from the connection poll and epoll

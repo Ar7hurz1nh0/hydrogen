@@ -52,7 +52,7 @@ pub struct Connection {
     /// They may have internal buffers
     pub tx_mutex: Mutex<()>,
     /// Socket (Stream implemented trait-object).
-    pub stream: Arc<UnsafeCell<Stream>>
+    pub stream: Arc<UnsafeCell<dyn Stream>>
 }
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
@@ -64,7 +64,7 @@ pub struct MutSlab {
 unsafe impl Send for MutSlab {}
 unsafe impl Sync for MutSlab {}
 
-pub struct EventHandler(pub *mut Handler);
+pub struct EventHandler(pub *mut dyn Handler);
 unsafe impl Send for EventHandler {}
 unsafe impl Sync for EventHandler {}
 impl Clone for EventHandler {
@@ -109,10 +109,10 @@ impl HydrogenSocket {
     pub fn send(&self, buf: &[u8]) {
         let err;
         { // Mutex lock
-            let _ = match self.arc_connection.tx_mutex.lock() {
+            drop(match self.arc_connection.tx_mutex.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner()
-            };
+            });
 
             let stream_ptr = self.arc_connection.stream.get();
             let write_result = unsafe {
