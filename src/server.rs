@@ -65,6 +65,16 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
     unsafe {
         thread::Builder::new()
             .name("Event Loop".to_string())
+            // !FIXME: Fix this error on simple-slab >= 0.3
+            // `*mut Connection` cannot be sent between threads safely
+            // within `Slab<Connection>`, the trait `Send` is not implemented for `*mut Connection`
+            // the trait `Send` is implemented for `Connection`
+            // required for `Mutex<Slab<Connection>>` to implement `Sync`
+            // required for `Arc<Mutex<Slab<Connection>>>` to implement `Send`rustcE0277
+            // server.rs(68, 14): required by a bound introduced by this call
+            // lib.rs(1, 1): required because it appears within the type `Slab<Connection>`
+            // server.rs(68, 20): required because it's used within this closure
+            // mod.rs(415, 12): required by a bound in `std::thread::Builder::spawn`
             .spawn(move || event_loop(new_connections, connection_slab, eh_clone, threads))
             .unwrap();
     }
