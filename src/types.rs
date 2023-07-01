@@ -80,7 +80,7 @@ impl Clone for EventHandler {
 /// Thread-safe wrapper for consumer interaction with streams.
 pub struct HydrogenSocket {
     /// The connection this socket represents
-    arc_connection: Arc<Connection>,
+    pub arc_connection: Arc<Connection>,
     /// Function responsible for re-arming fd in epoll instance
     rearm_fn: unsafe fn(&Arc<Connection>, i32)
 }
