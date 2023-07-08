@@ -9,6 +9,7 @@ use std::cell::UnsafeCell;
 use std::io::{Error, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{mem, thread};
@@ -43,7 +44,7 @@ const MAX_EVENTS: i32 = 100;
 #[allow(non_upper_case_globals)]
 static mut epfd: RawFd = 0 as RawFd;
 
-pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
+pub fn begin(handler: Box<dyn Handler>, cfg: Config, drop_handler: Option<Arc<AtomicBool>>) {
     info!("Starting server...");
 
     // Wrap handler in something we can share between threads
@@ -75,7 +76,15 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
             // lib.rs(1, 1): required because it appears within the type `Slab<Connection>`
             // server.rs(68, 20): required because it's used within this closure
             // mod.rs(415, 12): required by a bound in `std::thread::Builder::spawn`
-            .spawn(move || event_loop(new_connections, connection_slab, eh_clone, threads))
+            .spawn(move || {
+                event_loop(
+                    new_connections,
+                    connection_slab,
+                    eh_clone,
+                    threads,
+                    drop_handler,
+                )
+            })
             .unwrap();
     }
 
@@ -91,18 +100,18 @@ pub fn begin(handler: Box<dyn Handler>, cfg: Config) {
 }
 
 unsafe fn listener_loop(cfg: Config, new_connections: NewConnectionSlab, handler: EventHandler) {
-    info!("Starting incoming TCP connection listener...");
+    debug!("Starting incoming TCP connection listener...");
     let listener_result = TcpListener::bind((&cfg.addr[..], cfg.port));
     if listener_result.is_err() {
         let err = listener_result.unwrap_err();
         error!("Creating TcpListener: {}", err);
-        panic!();
+        panic!("{}", err);
     }
 
     let listener = listener_result.unwrap();
     setup_listener_options(&listener, handler.clone());
 
-    info!("Incoming TCP conecction listener started");
+    debug!("Incoming TCP connection listener started");
 
     for accept_attempt in listener.incoming() {
         match accept_attempt {
@@ -111,13 +120,13 @@ unsafe fn listener_loop(cfg: Config, new_connections: NewConnectionSlab, handler
         };
     }
 
-    debug!("Dropping TcpListener");
+    trace!("Dropping TcpListener");
 
     drop(listener);
 }
 
 unsafe fn setup_listener_options(listener: &TcpListener, handler: EventHandler) {
-    info!("Setting up listener options");
+    debug!("Setting up listener options");
     let fd = listener.as_raw_fd();
     let EventHandler(handler_ptr) = handler;
 
@@ -160,24 +169,25 @@ unsafe fn event_loop(
     connection_slab: ConnectionSlab,
     handler: EventHandler,
     threads: usize,
+    drop_handler: Option<Arc<AtomicBool>>,
 ) {
-    info!("Event loop starting...");
+    debug!("Event loop starting...");
     const MAX_WAIT: i32 = 1000; // Milliseconds
 
-    info!("Creating epoll instance...");
+    debug!("Creating epoll instance...");
     // Attempt to create an epoll instance
     let result = libc::epoll_create(1);
     if result < 0 {
         let err = Error::from_raw_os_error(errno().0 as i32);
         error!("Creating epoll instance: {}", err);
-        panic!();
+        panic!("{}", err);
     }
 
     // Epoll instance
     epfd = result;
-    info!("Epoll instance created with fd: {}", epfd);
+    debug!("Epoll instance created with fd: {}", epfd);
 
-    info!("Creating I/O threadpool with {} threads", threads);
+    debug!("Creating I/O threadpool with {} threads", threads);
 
     // ThreadPool with user specified number of threads
     let thread_pool = ThreadPool::new(threads);
@@ -200,28 +210,52 @@ unsafe fn event_loop(
     let mut event_buffer = Vec::<libc::epoll_event>::with_capacity(MAX_EVENTS as usize);
     event_buffer.set_len(MAX_EVENTS as usize);
 
-    info!("Starting epoll_wait loop...");
-    loop {
-        // Remove any connections in an error'd state.
-        remove_stale_connections(&connection_slab, &thread_pool, &handler);
+    debug!("Starting epoll_wait loop...");
+    match drop_handler {
+        Some(drop_handler) => while !drop_handler.load(Ordering::Relaxed) {
+            // Remove any connections in an error'd state.
+            remove_stale_connections(&connection_slab, &thread_pool, &handler);
 
-        // Insert any newly received connections into the connection_slab
-        insert_new_connections(&new_connections, &connection_slab);
+            // Insert any newly received connections into the connection_slab
+            insert_new_connections(&new_connections, &connection_slab);
 
-        // Check for any new events
-        let result = libc::epoll_wait(epfd, event_buffer.as_mut_ptr(), MAX_EVENTS, MAX_WAIT);
-        if result < 0 {
-            let err = Error::from_raw_os_error(errno().0 as i32);
-            error!("During epoll_wait: {}", err);
-            panic!();
-        }
+            // Check for any new events
+            let result = libc::epoll_wait(epfd, event_buffer.as_mut_ptr(), MAX_EVENTS, MAX_WAIT);
+            if result < 0 {
+                let err = Error::from_raw_os_error(errno().0 as i32);
+                error!("During epoll_wait: {}", err);
+                panic!("{}", err);
+            }
 
-        let num_events = result as usize;
-        update_io_events(
-            &connection_slab,
-            &arc_io_queue,
-            &event_buffer[0..num_events],
-        );
+            let num_events = result as usize;
+            update_io_events(
+                &connection_slab,
+                &arc_io_queue,
+                &event_buffer[0..num_events],
+            );
+        },
+        None => loop {
+            // Remove any connections in an error'd state.
+            remove_stale_connections(&connection_slab, &thread_pool, &handler);
+
+            // Insert any newly received connections into the connection_slab
+            insert_new_connections(&new_connections, &connection_slab);
+
+            // Check for any new events
+            let result = libc::epoll_wait(epfd, event_buffer.as_mut_ptr(), MAX_EVENTS, MAX_WAIT);
+            if result < 0 {
+                let err = Error::from_raw_os_error(errno().0 as i32);
+                error!("During epoll_wait: {}", err);
+                panic!("{}", err);
+            }
+
+            let num_events = result as usize;
+            update_io_events(
+                &connection_slab,
+                &arc_io_queue,
+                &event_buffer[0..num_events],
+            );
+        },
     }
 }
 

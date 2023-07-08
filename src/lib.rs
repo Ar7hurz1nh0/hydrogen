@@ -124,6 +124,7 @@ use std::io::Error;
 use std::sync::Arc;
 use std::cell::UnsafeCell;
 use std::os::unix::io::{RawFd, AsRawFd};
+use std::sync::atomic::AtomicBool;
 
 
 pub use config::Config;
@@ -173,8 +174,8 @@ pub trait Handler {
 }
 
 /// Starts the server with the passed configuration and handler.
-pub fn begin<T>(handler: Box<T>, cfg: Config)
+pub fn begin<T>(handler: Box<T>, cfg: Config, drop_handler: Option<Arc<AtomicBool>>)
     where T: Handler + Send + Sync + 'static
 {
-    server::begin(handler, cfg);
+    server::begin(handler, cfg, drop_handler);
 }
